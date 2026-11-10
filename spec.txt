@@ -1,0 +1,299 @@
+<USER_REQUEST>
+# Prompt: rediseño profesional de la interfaz (PySide6) del almacén AS/RS
+
+## 0. Cómo trabajar (léelo primero)
+
+Eres un ingeniero de software senior con criterio de diseño de interfaces industriales (HMI/SCADA).
+Vas a **rediseñar la capa visual** de una aplicación PySide6 ya funcional. Antes de escribir código:
+
+1. Lee completos `gui_main.py`, `service_layer.py`, `workers.py`, `grid_config.py` e `history_db.py`.
+2. Escribe un plan corto (qué archivos vas a crear/modificar y en qué orden) y espera mi confirmación solo si
+   algo del plan contradice este documento. Si no hay contradicción, sigue.
+3. Trabaja en **fases** (sección 9). Al terminar cada fase, ejecuta la app, genera capturas (sección 10) y
+   resume qué cambió. No avances a la siguiente fase con la anterior rota.
+
+**Si ves una forma mejor de resolver algo** (una señal de Qt más adecuada, un patrón más simple, un riesgo que
+no previne), impleméntala y explica en 2–3 líneas por qué te desvías. Este documento describe el
+comportamiento y la apariencia esperados, no una implementación línea por línea. Si algo de este documento te
+parece un error de diseño, dilo.
+
+## 1. Contexto
+
+- Proyecto: prototipo de **transelevador (AS/RS) a escala**, 3 ejes, controlado por una placa **GRBL 1.1**
+  (Annoy Tools) por USB serie. Celdas 2×2 ampliables (N×M). Historial en **SQLite**.
+- Es un proyecto universitario (TECSUP, Proyectos de Automatización) que se sustenta ante un docente. La
+  interfaz debe verse como la de una **planta real**: sobria, clara, sin adornos. Es la versión de laboratorio
+  de un diseño industrial (PLC + HMI + WMS); la app Python hace de HMI/SCADA.
+- Usuario principal: **operador de almacén** (ingresa y retira ítems). Usuario secundario: quien da
+  mantenimiento/calibra. Son tareas distintas y no deben mezclarse en la misma pantalla.
+
+## 2. Alcance: qué se toca y qué NO
+
+**Se rediseña:** apariencia (tema, tipografía, iconos, espaciado), estructura de pantallas, widgets, flujos de
+operación del usuario, estados de habilitación de controles.
+
+**NO se reescribe la lógica de negocio.** Conserva tal cual (puedes añadir métodos pequeños, no cambiar los
+existentes):
+- `WarehouseService`, `HistoryDB` y su transacción atómica (`record_cell_movement_tx`).
+- `GRBLController`, `AxisCalibrator`, los workers (`PositionPoller`, `JogWorker`, `CalibrationWorker`) y sus señales.
+- El historial es de **solo inserción**: ninguna pantalla debe permitir editar ni borrar movimientos.
+
+Si necesitas un dato que el servicio no expone (por ejemplo "primera celda vacía"), añade un método nuevo y
+pequeño en `WarehouseService`, sin modificar los existentes.
+
+## 3. Filosofía de diseño (norma ISA-101 para HMI)
+
+1. **El estado normal es visualmente tranquilo.** Fondos grises, sin colores saturados. El color fuerte se
+   reserva para lo anormal; así una alarma se ve de inmediato.
+2. **El color nunca es el único indicador.** Todo estado con color lleva además texto o ícono (para daltonismo
+   y proyectores).
+3. **Jerarquía clara:** lo que el operador usa cada minuto (estado, celdas, ingresar/retirar, paro) es lo más
+   visible; lo que casi nunca se usa (configuración, calibración) está apartado.
+4. **Seguridad primero:** el paro de emergencia y la pausa están siempre visibles y accesibles, sin importar la
+   pestaña. Las acciones destructivas pasan por confirmación explícita.
+5. **Operación y mantenimiento separados.** Mover los ejes a mano, calibrar y capturar celdas es "modo
+   mantenimiento" y exige confirmación para entrar.
+6. **Sin emojis.** Usa un set de iconos consistente (ver 5.4).
+
+## 4. Sistema de diseño (tokens)
+
+Crea `theme.py` con los tokens como constantes y una función que genere el QSS. **No** repitas colores
+literales por los widgets: todo viene de `theme.py`.
+
+### 4.1 Paleta — tema oscuro (por defecto)
+
+| Token | Uso | Hex |
+|---|---|---|
+| `BG` | Fondo de la ventana | `#14181F` |
+| `SURFACE` | Paneles y tarjetas | `#1E242D` |
+| `SURFACE_ALT` | Filas alternas, campos de entrada | `#181D25` |
+| `BORDER` | Bordes y separadores | `#2F3844` |
+| `TEXT` | Texto principal | `#E6EAF0` |
+| `TEXT_MUTED` | Texto secundario | `#8B96A5` |
+| `ACCENT` | Botón principal, selección, celda ocupada | `#3B82C4` |
+| `OK` | Normal / operativo / celda vacía | `#3FA66B` |
+| `WARN` | Advertencia / reservada / pausa | `#E0A030` |
+| `ALARM` | Alarma / paro de emergencia (solo esto) | `#D64545` |
+| `NEUTRAL` | Sin dato / desconectado / posición no confirmada | `#5C6673` |
+
+Reglas de color:
+- Superficies grandes: siempre grises. El verde/ámbar/rojo aparece en **indicadores pequeños, bordes y texto**,
+  no en rellenos grandes.
+- El **rojo es solo para alarmas y el paro de emergencia**. Nada más puede ser rojo (ni "desconectar", ni
+  "eliminar"; esos son botones secundarios con borde).
+- Las posiciones X/Y/Z se muestran **del mismo color** (texto principal). Nada de un color distinto por eje.
+- Contraste mínimo 4.5:1 entre texto y fondo.
+
+### 4.2 Tema claro (variante para proyector)
+
+Mismas reglas, tokens distintos: `BG #EEF1F5`, `SURFACE #FFFFFF`, `SURFACE_ALT #F5F7FA`, `BORDER #CBD2DC`,
+`TEXT #1B2430`, `TEXT_MUTED #5B6675`; los colores de estado se oscurecen un 10–15 % para mantener contraste.
+Añade un selector en Configuración (Oscuro / Claro) persistido con `QSettings`. Por defecto, oscuro.
+
+### 4.3 Tipografía, forma y espaciado
+
+- Fuente: `Inter` con respaldo `Segoe UI`. Números, coordenadas e IDs: monoespaciada (`JetBrains Mono`, respaldo
+  `Consolas`) para que no "bailen" al cambiar.
+- Escala: títulos de sección 16 px semibold; texto 13 px; etiquetas pequeñas 11 px en `TEXT_MUTED`;
+  lecturas de posición 22 px mono.
+- Radio de esquinas 6 px. **Sin sombras ni degradados.** Bordes de 1 px (`BORDER`).
+- Espaciado en múltiplos de 4 px (8 / 12 / 16 / 24). Márgenes de ventana 16 px.
+- Altura mínima de botones de operación: 44 px (uso táctil o con guantes). Botones secundarios: 32–36 px.
+
+### 4.4 Botones (tres niveles, no más)
+
+- **Primario:** relleno `ACCENT`, texto blanco. Máximo uno por zona.
+- **Secundario:** fondo `SURFACE`, borde `BORDER`, texto `TEXT`. Hover: borde `ACCENT`.
+- **Peligro:** borde `ALARM` y texto `ALARM`, fondo transparente; solo el **Paro de emergencia** es relleno rojo.
+- Estado deshabilitado: texto `NEUTRAL`, sin hover, y siempre con un *tooltip* que diga **por qué** está
+  deshabilitado (por ejemplo "Referencia primero los ejes").
+
+### 4.5 Iconos
+
+Usa `qtawesome` (instálalo; es puro Python y funciona con PySide6) con un solo set (Material Design Icons o
+Phosphor). Iconos en monocromo del color del texto. Si no puedes instalarlo, usa texto sin icono; **no** vuelvas
+a los emojis.
+
+## 5. Arquitectura de la UI
+
+`gui_main.py` ya es muy largo. Sin reescribirlo todo, extrae lo reutilizable:
+
+- `theme.py` — tokens, `build_qss(theme)`, helpers de color.
+- `widgets.py` — componentes reutilizables:
+  - `StatusBar` (barra superior, ver 6.1).
+  - `AlarmBanner` — conserva su API (`mostrar(tipo, mensaje, texto_btn, callback)` / `ocultar(tipo)`) y su
+    prioridad (alarm > conexion > almacen_lleno), pero con colores de los tokens (franja superior de 3 px del
+    color + fondo `SURFACE`, no un bloque pastel).
+  - `KpiCard` — título pequeño en `TEXT_MUTED` y valor grande mono.
+  - `CellTile` / `CellGridView` — la malla de celdas (ver 6.2).
+  - `Warehouse2DCanvas` — conserva su lógica y adapta colores a los tokens.
+  - `EmergencyBar` — pausa/reanudar y paro (ver 6.1).
+  - `StateChip` — pastilla de estado: icono + texto + color.
+- Las pestañas pueden seguir en `gui_main.py` en esta etapa; separar cada pestaña a su archivo es opcional y
+  queda para el final si hay tiempo.
+
+## 6. Pantallas
+
+### 6.1 Marco fijo (visible en todas las pestañas)
+
+Arriba, de izquierda a derecha en una sola barra de 56 px:
+- Título del sistema (texto, sin emoji).
+- `StateChip` de **conexión**: Conectado (OK) / Desconectado (NEUTRAL).
+- `StateChip` de **estado del equipo**: Desconectado · Sin referenciar · Listo · En movimiento · Pausa · Alarma
+  (a partir del campo `state` del reporte `?` que ya parsea `PositionPoller`).
+- Posición **X / Y / Z** en mono. Si el origen no está confirmado, en `NEUTRAL` con el aviso
+  "no confirmada" (no uses un color distinto por eje).
+- Selector de puerto + botón Conectar/Desconectar (secundario).
+- A la derecha, **`EmergencyBar` siempre visible**: botón "Pausar/Reanudar" (WARN, borde) y **PARO DE EMERGENCIA**
+  (relleno `ALARM`, texto blanco, 44 px de alto). El paro actúa de inmediato, **sin diálogo de confirmación**.
+
+Debajo de la barra, el `AlarmBanner` (oculto cuando no hay alarmas).
+
+### 6.2 Pestaña "Operación" (reemplaza al Dashboard actual)
+
+Tres zonas:
+
+**Izquierda (60 %) — plano del almacén.** Una malla de celdas dibujada con `QGraphicsScene`/`QGraphicsView` (o un
+widget propio) que se escala con la ventana. Cada celda es una tarjeta con:
+- Fondo tenue del color de su estado (≈15 % de opacidad) + **borde sólido de 2 px** del color + texto:
+  - **Vacía:** borde `OK`, texto "VACÍA".
+  - **Ocupada:** borde `ACCENT`, texto "OCUPADA" y el código del ítem.
+  - **Reservada:** borde `WARN`, texto "RESERVADA".
+  - **Sin coordenadas:** borde `NEUTRAL` discontinuo, texto "SIN POSICIÓN".
+- ID de la celda arriba a la izquierda (mono).
+- Si el carro está sobre esa celda (posición del poller dentro de ±5 mm de las coordenadas), un marcador animado
+  de 2 px alrededor ("CARRO AQUÍ").
+- Clic en una celda → **panel lateral** (no un diálogo modal) con su estado, contenido y último movimiento. Las
+  acciones manuales (registrar entrada, salida, reservar, "mover a esta celda") van ahí, en botones secundarios.
+- Actualiza las tarjetas **en sitio**; no destruyas y vuelvas a crear los widgets en cada refresco (parpadea).
+
+**Derecha superior — operación.** Dos botones grandes (44–56 px): **"Ingresar ítem"** (primario) y
+**"Retirar ítem"** (secundario).
+- *Ingresar:* pide el código del ítem, el sistema propone la primera celda vacía (el operador puede cambiarla en un
+  selector), muestra un resumen y confirma. Registra la entrada con `registrar_entrada` y, si hay conexión y el
+  origen está confirmado, ofrece "Mover el carro a la celda".
+- *Retirar:* búsqueda por código o selección de la celda ocupada; registra la salida con `registrar_salida`.
+- Máximo **3 clics** desde la pantalla de inicio hasta completar un ingreso o un retiro.
+- Si el almacén está lleno, "Ingresar" se deshabilita con tooltip y el banner `almacen_lleno` aparece.
+
+**Derecha inferior — resumen.** Dos `KpiCard` (Ocupación %, Movimientos hoy) y una tabla compacta de los últimos
+7 movimientos (solo lectura, columnas Hora / Celda / Tipo / Ítem; el tipo con un `StateChip`, no con fondo de
+fila de color).
+
+> **Mueve "Vaciar todo el almacén" a Configuración → "Zona de peligro".** No debe estar junto a la tabla de
+> operación. Exige escribir la palabra `VACIAR` para habilitar el botón.
+
+### 6.3 Pestaña "Historial"
+
+- Barra de filtros en una fila: Celda, Tipo, Texto, rango de fechas, botón "Filtrar" (primario), "Limpiar"
+  (secundario). El botón de exportar a CSV queda como secundario (prioridad baja).
+- `QTableView` con modelo de solo lectura. Filas alternas con `SURFACE`/`SURFACE_ALT`; **sin** colorear la fila
+  completa según el tipo: usa una pastilla pequeña en la columna "Tipo" (ENTRADA → `ACCENT`, SALIDA → `TEXT_MUTED`
+  con borde, RESERVA → `WARN`, AJUSTE → `NEUTRAL`).
+- Columnas numéricas y fechas en mono, alineadas; paginación o scroll virtual si hay muchos registros.
+- Sin ninguna acción de editar o borrar.
+
+### 6.4 Pestaña "Mantenimiento"
+
+Reúne lo que hoy está repartido entre "Control Manual" y "Configuración": jog, calibración y captura de celdas.
+
+- **Candado de entrada:** al abrir la pestaña se muestra un panel "Modo mantenimiento — el movimiento manual puede
+  dañar el equipo" con el botón **"Entrar en modo mantenimiento"**. Hasta confirmarlo, los controles están
+  bloqueados. Al salir de la pestaña, el origen se marca como "no confirmado" y se exige referenciar de nuevo
+  antes de operar.
+- **Jog:** cruceta X/Y y botones Z con la velocidad configurable. Mientras el estado sea `Hold` o `Alarm`, los
+  botones de jog se deshabilitan (con tooltip).
+- **Comandos:** Home (`$H`), Unlock (`$X`), Zero aquí (`G92`), Pausar/Reanudar. Cada uno con su tooltip.
+- **Vista 2D del plano X-Y** con el puntero en tiempo real y las celdas (reutiliza `Warehouse2DCanvas`).
+- **Captura de celdas:** botón "Capturar celda en posición actual". Si la celda ya existe, un único diálogo
+  muestra coordenadas actuales vs nuevas con Sí/No (sin casilla "Sobrescribir").
+- **Asistente de calibración:** conserva los pasos y las señales actuales, con diseño de pasos numerados (1 → 2 →
+  3 → 4) en un indicador de progreso arriba y botones "Atrás/Siguiente" propios. Cancelar siempre disponible.
+
+### 6.5 Pestaña "Configuración"
+
+- Layout de la malla (filas, columnas, X0, Y0, dx, dy) con vista previa.
+- Edición manual de celdas (tabla).
+- Tema (Oscuro/Claro).
+- **Zona de peligro** (borde `ALARM` tenue): "Vaciar todo el almacén" con confirmación escrita.
+
+## 7. Reglas de habilitación por estado
+
+| Estado del equipo | Ingresar/Retirar | Mover a celda | Jog | Home/Unlock | Calibrar |
+|---|---|---|---|---|---|
+| Desconectado | Solo registro en BD (sin mover) | No | No | No | No |
+| Conectado, sin referenciar | Solo registro en BD | No | Solo en mantenimiento | Sí | Solo en mantenimiento |
+| Listo | Sí | Sí | Solo en mantenimiento | Sí | Solo en mantenimiento |
+| En movimiento | No | No | No | No | No |
+| Pausa (`Hold`) | No | No | No | Reanudar | No |
+| Alarma | No | No | No | Solo Unlock | No |
+
+Implementa esto en **un solo lugar** (una función `apply_state(state)` que habilita/deshabilita), no con `if`
+repartidos por los handlers. Cada control deshabilitado explica el motivo en su tooltip.
+
+## 8. Accesibilidad y robustez
+
+- Todo estado con color lleva texto o icono.
+- Atajos: `Ctrl+1…4` para las pestañas; `Esc` cierra paneles; el paro de emergencia visible siempre.
+- La ventana debe verse bien entre 1100×700 y 1920×1080 (layouts con *stretch*, nada de tamaños fijos de
+  ventana salvo en botones).
+- La UI nunca se congela: nada de operaciones serial o de base de datos largas en el hilo principal.
+- Textos en español, tono directo y sin signos de exclamación.
+
+## 9. Plan por fases (con puntos de control)
+
+1. **Tema:** `theme.py` + QSS + fuente + iconos; aplicarlo a toda la app y quitar los emojis y los estilos
+   literales. *Punto de control:* captura de las 4 pestañas actuales con el nuevo tema.
+2. **Marco fijo:** `StatusBar`, `StateChip`, `EmergencyBar`, `AlarmBanner` con tokens; función `apply_state`.
+3. **Pestaña Operación:** malla de celdas, panel lateral, flujos Ingresar/Retirar, KPIs y tabla compacta; mover
+   "Vaciar todo" a Configuración.
+4. **Historial y Configuración** rediseñados.
+5. **Mantenimiento:** unir jog + calibración + captura; candado de entrada; indicador de pasos del asistente.
+6. **Tema claro**, persistencia con `QSettings` y revisión final.
+
+## 10. Verificación
+
+- Ejecuta la app con `QT_QPA_PLATFORM=offscreen` y genera capturas con `widget.grab().save(...)` de cada pestaña
+  en los estados: desconectado, conectado sin origen, listo, alarma, almacén lleno y pausa. Guárdalas en
+  `docs/screens/` y descríbeme lo que ves.
+- Comprueba contrastes con una función auxiliar (relación ≥ 4.5:1 para texto normal).
+- Prueba manualmente: un ingreso y un retiro completos en ≤ 3 clics; que el paro de emergencia responda desde
+  cualquier pestaña; que ningún control destructivo quede sin confirmación.
+
+## 11. Errores que ya existen en el código — corrígelos si tocas esas zonas
+
+Estos puntos los vi al leer `gui_main.py`; no son de diseño pero afectan la seguridad y la estabilidad:
+
+1. **Jog por teclado sin parada.** `_setup_keyboard_jog` usa `QShortcut.activated`, que solo dispara al *pulsar*;
+   nunca llama a `stop_jog` al soltar la tecla y el eje sigue moviéndose. Implementa `keyPressEvent` /
+   `keyReleaseEvent` ignorando `isAutoRepeat()` y llamando a `stop_jog` al soltar (y al perder el foco).
+2. **`QThread.create(...)` en `_move_to_cell_bg`.** No es una API fiable en PySide6. Usa un worker con
+   `moveToThread` (como los otros) o `QThreadPool` + `QRunnable`.
+3. **Escritura directa al puerto serie** en `_send_feed_hold`/`_send_cycle_start`: pasa por un método del
+   controlador protegido por el mismo *lock* que usan los demás comandos; si no existe ese lock, añádelo.
+4. **Referencias a hilos de calibración** (`calib_worker_thread`) que se recrean sin esperar a que terminen:
+   asegúrate de que el anterior terminó (`quit()` + `wait()`) antes de crear uno nuevo.
+5. **Regenerar toda la malla en cada refresco** (`deleteLater` de todos los widgets): actualiza en sitio.
+
+## 12. Lo que NO debes hacer
+
+- No cambies la lógica de movimiento, calibración o base de datos.
+- No agregues colores nuevos fuera de los tokens, ni degradados, ni sombras, ni animaciones llamativas.
+- No uses emojis ni mezcles varios sets de iconos.
+- No pongas confirmación al paro de emergencia.
+- No agregues dependencias pesadas (solo `qtawesome` como máximo).
+- No elimines funcionalidad existente sin avisarme: si algo se mueve de pestaña, indícalo en el resumen.
+
+## Entregable esperado
+
+- `theme.py`, `widgets.py` y los cambios en `gui_main.py` (y en `service_layer.py` solo con métodos nuevos
+  pequeños si hacen falta).
+- Capturas en `docs/screens/` de cada pestaña y estado.
+- Un resumen final con: qué cambió por fase, qué se movió de lugar, qué decisiones tomaste distintas a este documento (y por qué) y qué errores de la sección 11 corregiste.
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-10-26T05:23:47-05:00.
+</ADDITIONAL_METADATA>
+<USER_SETTINGS_CHANGE>
+The user changed setting `Model Selection` from  to Claude Opus 4.6 (Thinking). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.
+</USER_SETTINGS_CHANGE>
